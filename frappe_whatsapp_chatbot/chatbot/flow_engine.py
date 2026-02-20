@@ -560,16 +560,20 @@ class FlowEngine:
             response = {"message": "Select an invoice:", "content_type": "interactive", "buttons": json.dumps(buttons)}
         """
         try:
+            frappe.log_error(f"DEBUG: run_response_script starting. Keys: {list(data.keys())}", "FlowEngine Debug")
             eval_globals = {
                 "data": data,
                 "frappe": frappe,
                 "json": json,
                 "session": session,
                 "phone_number": self.phone_number,
+                "mobile_no": self.phone_number, # Alias for user convenience
                 "response": None
             }
             exec(script, eval_globals)
-            return eval_globals.get("response")
+            response = eval_globals.get("response")
+            frappe.log_error(f"DEBUG: run_response_script finished. Response: {response}", "FlowEngine Debug")
+            return response
         except Exception as e:
-            frappe.log_error(f"FlowEngine run_response_script error: {str(e)}")
+            frappe.log_error(f"FlowEngine run_response_script error: {str(e)}", "FlowEngine Error")
             return None
