@@ -88,27 +88,75 @@ class FlowEngine:
                 return {
                     "use_template": 1,
                     "template": flow.initial_template,
-                    "message_type": "Template"
+                    "message_type": "Template",
+                    "content_type": "text"
                 }
 
-            # Combine initial message with first step message
+            # Run first step — auto-advance through Script+None-input steps
+            current_step = first_step
+            step_msg = self.build_step_message(current_step, session)
+
+            # Auto-advance: if step needs no user input (Script+None), keep advancing
+            while current_step.input_type == "None" and (not step_msg or step_msg == ""):
+                next_step_name = self.get_next_step(current_step, flow.steps, None, None)
+                if not next_step_name:
+                    return self.complete_flow(session, flow)
+
+                # Find next step
+                next_step = None
+                for s in flow.steps:
+                    if s.step_name == next_step_name:
+                        next_step = s
+                        break
+                if not next_step:
+                    return self.complete_flow(session, flow)
+
+                # Check skip conditions (loop through consecutive skippable steps)
+                session_data = parse_json(session.session_data, {})
+                max_skips = 10
+                skips = 0
+                while next_step.skip_condition and skips < max_skips:
+                    if not self.evaluate_skip_condition(next_step.skip_condition, session_data):
+                        break
+                    next_step_name = self.get_next_step(next_step, flow.steps, None, None)
+                    if not next_step_name:
+                        return self.complete_flow(session, flow)
+                    found = False
+                    for s in flow.steps:
+                        if s.step_name == next_step_name:
+                            next_step = s
+                            found = True
+                            break
+                    if not found:
+                        return self.complete_flow(session, flow)
+                    skips += 1
+
+                current_step = next_step
+                session.current_step = current_step.step_name
+                session.save(ignore_permissions=True)
+                frappe.db.commit()
+                step_msg = self.build_step_message(current_step, session)
+
+            # Update session to final step
+            session.current_step = current_step.step_name
+            session.save(ignore_permissions=True)
+            frappe.db.commit()
+
+            # Combine initial message with step message
             messages = []
             if flow.initial_message:
                 messages.append(flow.initial_message)
 
-            step_msg = self.build_step_message(first_step, session)
             if isinstance(step_msg, str):
                 messages.append(step_msg)
                 return "\n\n".join(messages) if messages else step_msg
             else:
                 # Step returns a complex message (buttons, template)
-                if messages:
-                    # Send initial message first, then step message
-                    return messages[0]  # We'll handle multi-message later
+                # Return the complex response directly — it takes priority
                 return step_msg
 
         except Exception as e:
-            frappe.log_error(f"FlowEngine start_flow error: {str(e)}")
+            frappe.log_error(f"start_flow error: {str(e)[:100]}")
             return None
 
     def process_input(self, session, user_input, button_payload=None):
@@ -187,19 +235,25 @@ class FlowEngine:
             if not next_step:
                 return self.complete_flow(session, flow)
 
-            # Check skip condition for next step
+            # Check skip condition for next step (loop to skip multiple consecutive steps)
             session_data = parse_json(session.session_data, {})
-            if next_step.skip_condition:
-                if self.evaluate_skip_condition(next_step.skip_condition, session_data):
-                    # Skip this step, find the one after
-                    next_step_name = self.get_next_step(next_step, flow.steps, None, None)
-                    if not next_step_name:
-                        return self.complete_flow(session, flow)
-
-                    for step in flow.steps:
-                        if step.step_name == next_step_name:
-                            next_step = step
-                            break
+            max_skips = 10  # Safety limit
+            skips = 0
+            while next_step.skip_condition and skips < max_skips:
+                if not self.evaluate_skip_condition(next_step.skip_condition, session_data):
+                    break  # Condition not met, show this step
+                next_step_name = self.get_next_step(next_step, flow.steps, None, None)
+                if not next_step_name:
+                    return self.complete_flow(session, flow)
+                found = False
+                for step in flow.steps:
+                    if step.step_name == next_step_name:
+                        next_step = step
+                        found = True
+                        break
+                if not found:
+                    return self.complete_flow(session, flow)
+                skips += 1
 
             # Update session
             session.current_step = next_step.step_name
@@ -210,6 +264,37 @@ class FlowEngine:
 
             # Build and return next step message
             response = self.build_step_message(next_step, session)
+
+            # Auto-advance past Script steps with input_type=None that return no response
+            max_advances = 10  # Safety limit
+            advances = 0
+            while not response and next_step.input_type in ("None", None) and advances < max_advances:
+                # Script step ran but produced no response, advance to next step
+                adv_next_name = self.get_next_step(next_step, flow.steps, None, None)
+                if not adv_next_name:
+                    return self.complete_flow(session, flow)
+
+                adv_next = None
+                for step in flow.steps:
+                    if step.step_name == adv_next_name:
+                        adv_next = step
+                        break
+                if not adv_next:
+                    return self.complete_flow(session, flow)
+
+                # Check skip condition
+                session_data = parse_json(session.session_data, {})
+                if adv_next.skip_condition and self.evaluate_skip_condition(adv_next.skip_condition, session_data):
+                    next_step = adv_next
+                    advances += 1
+                    continue
+
+                next_step = adv_next
+                session.current_step = next_step.step_name
+                session.save(ignore_permissions=True)
+                frappe.db.commit()
+                response = self.build_step_message(next_step, session)
+                advances += 1
 
             # Log outgoing message
             if isinstance(response, str):
@@ -324,25 +409,54 @@ class FlowEngine:
     def build_step_message(self, step, session):
         """Build message for a step with variable substitution."""
         message = step.message or ""
-
-        # Substitute session variables
         session_data = parse_json(session.session_data, {})
+
+        # 1. Run script FIRST (if Script type) — script can set data variables
+        if step.message_type == "Script" and step.response_script:
+            script_response = self.run_response_script(step.response_script, session_data, session)
+            # Auto-persist any data changes the script made
+            session.session_data = json.dumps(session_data)
+            session.save(ignore_permissions=True)
+            frappe.db.commit()
+            if script_response:
+                return script_response
+            # Fall through to variable substitution + normal message handling
+
+        # 2. Substitute session variables AFTER script (so script-set vars work)
         for key, value in session_data.items():
             message = message.replace(f"{{{key}}}", str(value))
 
+        # 3. Template with dynamic params from session data
         if step.message_type == "Template" and step.template:
-            return {
+            template_response = {
                 "use_template": 1,
                 "template": step.template,
-                "message_type": "Template"
+                "message_type": "Template",
+                "content_type": "text"
             }
+            # Build body_param from session data if template_parameters defined
+            if getattr(step, 'template_parameters', None):
+                param_keys = [k.strip() for k in step.template_parameters.split(",")]
+                body_params = {}
+                for i, key in enumerate(param_keys):
+                    body_params[str(i + 1)] = str(session_data.get(key, ""))
+                template_response["body_param"] = json.dumps(body_params)
 
-        if step.message_type == "Script" and step.response_script:
-            script_response = self.run_response_script(step.response_script, session_data, session)
-            if script_response:
-                return script_response
-            # Fall back to message if script returns nothing
-            return message
+            # Build button_params for dynamic URL buttons
+            dynamic_urls = getattr(step, 'dynamic_button_url', None)
+            if dynamic_urls:
+                button_params = {}
+                for idx, url in enumerate(dynamic_urls.split(',')):
+                    url = url.strip()
+                    # Substitute session variables
+                    for key, value in session_data.items():
+                        url = url.replace(f"{{{key}}}", str(value))
+                    button_params[str(idx)] = url
+                
+                if button_params:
+                    template_response["_button_params"] = button_params
+
+            return template_response
 
         # Add buttons if defined
         if step.input_type == "Button" and step.buttons:
@@ -560,7 +674,6 @@ class FlowEngine:
             response = {"message": "Select an invoice:", "content_type": "interactive", "buttons": json.dumps(buttons)}
         """
         try:
-            frappe.log_error(f"DEBUG: run_response_script starting. Keys: {list(data.keys())}", "FlowEngine Debug")
             eval_globals = {
                 "data": data,
                 "frappe": frappe,
@@ -572,7 +685,6 @@ class FlowEngine:
             }
             exec(script, eval_globals)
             response = eval_globals.get("response")
-            frappe.log_error(f"DEBUG: run_response_script finished. Response: {response}", "FlowEngine Debug")
             return response
         except Exception as e:
             frappe.log_error(f"FlowEngine run_response_script error: {str(e)}", "FlowEngine Error")

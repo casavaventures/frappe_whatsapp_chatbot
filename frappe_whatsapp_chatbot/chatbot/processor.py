@@ -210,6 +210,9 @@ class ChatbotProcessor:
 
             elif isinstance(response, dict):
                 # Complex response (template, media, buttons, etc.)
+                # Extract _button_params before creating the doc (not a doctype field)
+                button_params = response.pop("_button_params", None)
+
                 msg_data = {
                     "doctype": "WhatsApp Message",
                     "type": "Outgoing",
@@ -219,14 +222,16 @@ class ChatbotProcessor:
                 msg_data.update(response)
 
                 msg = frappe.get_doc(msg_data)
+                if button_params:
+                    msg._button_params = button_params
                 msg.flags.ignore_chatbot = True
                 msg.insert(ignore_permissions=True)
                 frappe.db.commit()
 
         except Exception as e:
             frappe.log_error(
-                f"Chatbot send_response error: {str(e)}",
-                "WhatsApp Chatbot Error"
+                title="send_response error",
+                message=frappe.get_traceback()
             )
 
     def process_flow_response_in_session(self, session, flow_engine):
