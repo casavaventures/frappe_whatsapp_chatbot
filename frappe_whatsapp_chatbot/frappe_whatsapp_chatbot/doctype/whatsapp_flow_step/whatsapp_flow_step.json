@@ -15,6 +15,7 @@
   "buttons",
   "message_type",
   "template",
+  "template_parameters",
   "response_script",
   "options",
   "flow_field_mapping",
@@ -24,7 +25,8 @@
   "conditional_next",
   "skip_condition",
   "retry_on_invalid",
-  "max_retries"
+  "max_retries",
+  "dynamic_button_url"
  ],
  "fields": [
   {
@@ -40,8 +42,7 @@
    "fieldname": "message",
    "fieldtype": "Text",
    "in_list_view": 1,
-   "label": "Message",
-   "reqd": 1
+   "label": "Message"
   },
   {
    "default": "Text",
@@ -56,6 +57,13 @@
    "fieldtype": "Link",
    "label": "Template",
    "options": "WhatsApp Templates"
+  },
+  {
+   "depends_on": "eval:doc.message_type=='Template'",
+   "description": "Comma-separated session data keys to pass as template body parameters (e.g., full_name,user_email)",
+   "fieldname": "template_parameters",
+   "fieldtype": "Data",
+   "label": "Template Parameters"
   },
   {
    "depends_on": "eval:doc.message_type=='Script'",
@@ -169,11 +177,18 @@
    "fieldname": "max_retries",
    "fieldtype": "Int",
    "label": "Max Retries"
+  },
+  {
+   "depends_on": "eval:doc.message_type==\"Template\"",
+   "description": "Comma-separated dynamic URL suffixes for template buttons (e.g. magic-login?token={magic_token})",
+   "fieldname": "dynamic_button_url",
+   "fieldtype": "Data",
+   "label": "Dynamic Button URL"
   }
  ],
  "istable": 1,
  "links": [],
- "modified": "2025-12-10 21:46:29.139280",
+ "modified": "2026-02-25 16:58:26.335277",
  "modified_by": "Administrator",
  "module": "Frappe WhatsApp Chatbot",
  "name": "WhatsApp Flow Step",
