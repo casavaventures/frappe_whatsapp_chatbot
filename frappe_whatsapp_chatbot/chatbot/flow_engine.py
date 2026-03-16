@@ -118,7 +118,8 @@ class FlowEngine:
                 while next_step.skip_condition and skips < max_skips:
                     if not self.evaluate_skip_condition(next_step.skip_condition, session_data):
                         break
-                    next_step_name = self.get_next_step(next_step, flow.steps, None, None)
+                    # Skipped step — use idx order, not skipped step's routing
+                    next_step_name = self.get_next_step(next_step, flow.steps, None, None, idx_only=True)
                     if not next_step_name:
                         return self.complete_flow(session, flow)
                     found = False
@@ -247,7 +248,8 @@ class FlowEngine:
             while next_step.skip_condition and skips < max_skips:
                 if not self.evaluate_skip_condition(next_step.skip_condition, session_data):
                     break  # Condition not met, show this step
-                next_step_name = self.get_next_step(next_step, flow.steps, None, None)
+                # Skipped step — use idx order, not skipped step's routing
+                next_step_name = self.get_next_step(next_step, flow.steps, None, None, idx_only=True)
                 if not next_step_name:
                     return self.complete_flow(session, flow)
                 found = False
@@ -287,12 +289,22 @@ class FlowEngine:
                 if not adv_next:
                     return self.complete_flow(session, flow)
 
-                # Check skip condition
+                # Resolve skip conditions using idx order
                 session_data = parse_json(session.session_data, {})
-                if adv_next.skip_condition and self.evaluate_skip_condition(adv_next.skip_condition, session_data):
-                    next_step = adv_next
-                    advances += 1
-                    continue
+                skip_iters = 0
+                while adv_next.skip_condition and self.evaluate_skip_condition(adv_next.skip_condition, session_data) and skip_iters < 10:
+                    adv_next_name = self.get_next_step(adv_next, flow.steps, None, None, idx_only=True)
+                    if not adv_next_name:
+                        return self.complete_flow(session, flow)
+                    found = False
+                    for step in flow.steps:
+                        if step.step_name == adv_next_name:
+                            adv_next = step
+                            found = True
+                            break
+                    if not found:
+                        return self.complete_flow(session, flow)
+                    skip_iters += 1
 
                 next_step = adv_next
                 session.current_step = next_step.step_name
@@ -387,22 +399,28 @@ class FlowEngine:
 
         return True, None
 
-    def get_next_step(self, current_step, all_steps, user_input, button_payload):
-        """Determine the next step based on input."""
-        # Check conditional next
-        if current_step.conditional_next:
-            conditions = parse_json(current_step.conditional_next, {})
-            if conditions:
-                response_key = button_payload or (user_input.lower() if user_input else "")
+    def get_next_step(self, current_step, all_steps, user_input, button_payload, idx_only=False):
+        """Determine the next step based on input.
 
-                if response_key in conditions:
-                    return conditions[response_key]
-                if "default" in conditions:
-                    return conditions["default"]
+        When idx_only=True, skip conditional_next and explicit next_step —
+        only use sequential (idx) ordering.  Used when a step is *skipped*
+        so that the skipped step's routing doesn't hijack the flow path.
+        """
+        if not idx_only:
+            # Check conditional next
+            if current_step.conditional_next:
+                conditions = parse_json(current_step.conditional_next, {})
+                if conditions:
+                    response_key = button_payload or (user_input.lower() if user_input else "")
 
-        # Use explicit next step
-        if current_step.next_step:
-            return current_step.next_step
+                    if response_key in conditions:
+                        return conditions[response_key]
+                    if "default" in conditions:
+                        return conditions["default"]
+
+            # Use explicit next step
+            if current_step.next_step:
+                return current_step.next_step
 
         # Find next step by order
         sorted_steps = sorted(all_steps, key=lambda x: x.idx)
@@ -551,10 +569,32 @@ class FlowEngine:
                 if not next_step:
                     break
 
-                # If next step should be skipped, continue walking
-                if next_step.skip_condition and self.evaluate_skip_condition(next_step.skip_condition, session_data):
-                    step = next_step
-                    continue
+                # Resolve skip conditions using idx order
+                skip_iters = 0
+                while next_step.skip_condition and self.evaluate_skip_condition(next_step.skip_condition, session_data) and skip_iters < 10:
+                    idx_next = self.get_next_step(next_step, flow.steps, None, None, idx_only=True)
+                    if not idx_next:
+                        # All remaining steps skipped — complete silently
+                        session.status = "Completed"
+                        session.completed_at = datetime.now()
+                        session.save(ignore_permissions=True)
+                        if flow.on_complete_action == "Create Document":
+                            self.create_document(flow, session_data)
+                        elif flow.on_complete_action == "Call API":
+                            self.call_api(flow.api_endpoint, session_data)
+                        elif flow.on_complete_action == "Run Script":
+                            self.run_script(flow.custom_script, session_data)
+                        frappe.db.commit()
+                        return
+                    found = False
+                    for s in flow.steps:
+                        if s.step_name == idx_next:
+                            next_step = s
+                            found = True
+                            break
+                    if not found:
+                        break
+                    skip_iters += 1
 
                 # If next step requires user input, flow can't be completed yet
                 if next_step.input_type not in ("None", None):
