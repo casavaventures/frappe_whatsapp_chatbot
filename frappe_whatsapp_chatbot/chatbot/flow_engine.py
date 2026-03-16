@@ -142,6 +142,11 @@ class FlowEngine:
             session.save(ignore_permissions=True)
             frappe.db.commit()
 
+            # If the current step requires no user input, check if the flow
+            # should be silently completed after sending this message.
+            if current_step.input_type == "None":
+                self._try_silent_complete(session, flow, current_step)
+
             # Combine initial message with step message
             messages = []
             if flow.initial_message:
@@ -295,6 +300,12 @@ class FlowEngine:
                 frappe.db.commit()
                 response = self.build_step_message(next_step, session)
                 advances += 1
+
+            # If the landed step requires no user input, silently complete
+            # the flow so the customer doesn't get a stale completion message
+            # on their next reply.
+            if next_step.input_type in ("None", None):
+                self._try_silent_complete(session, flow, next_step)
 
             # Log outgoing message
             if isinstance(response, str):
@@ -499,6 +510,61 @@ class FlowEngine:
             return frappe.safe_eval(condition, eval_globals=eval_globals, eval_locals={})
         except Exception:
             return False
+
+    def _try_silent_complete(self, session, flow, current_step):
+        """Silently complete the flow if no more user input is needed.
+
+        Walks the remaining step path from current_step. If all remaining
+        steps have input_type=None (or are skipped), the flow is completed
+        without sending a completion message — the last visible message
+        (e.g. a template) serves as the final message instead.
+        """
+        try:
+            session_data = parse_json(session.session_data, {})
+            step = current_step
+            max_walks = 10
+
+            for _ in range(max_walks):
+                next_name = self.get_next_step(step, flow.steps, None, None)
+                if not next_name:
+                    # No more steps — complete silently
+                    session.status = "Completed"
+                    session.completed_at = datetime.now()
+                    session.save(ignore_permissions=True)
+
+                    if flow.on_complete_action == "Create Document":
+                        self.create_document(flow, session_data)
+                    elif flow.on_complete_action == "Call API":
+                        self.call_api(flow.api_endpoint, session_data)
+                    elif flow.on_complete_action == "Run Script":
+                        self.run_script(flow.custom_script, session_data)
+
+                    frappe.db.commit()
+                    return
+
+                # Find the next step
+                next_step = None
+                for s in flow.steps:
+                    if s.step_name == next_name:
+                        next_step = s
+                        break
+                if not next_step:
+                    break
+
+                # If next step should be skipped, continue walking
+                if next_step.skip_condition and self.evaluate_skip_condition(next_step.skip_condition, session_data):
+                    step = next_step
+                    continue
+
+                # If next step requires user input, flow can't be completed yet
+                if next_step.input_type not in ("None", None):
+                    return
+
+                # Next step is also a no-input step, keep walking
+                step = next_step
+
+        except Exception as e:
+            frappe.log_error(f"FlowEngine _try_silent_complete error: {str(e)}")
 
     def complete_flow(self, session, flow):
         """Complete a conversation flow."""
