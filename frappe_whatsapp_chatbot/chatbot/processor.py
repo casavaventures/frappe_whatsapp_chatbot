@@ -70,6 +70,11 @@ class ChatbotProcessor:
 
         # Only process text, button, and flow messages
         if self.content_type not in ["text", "button", "flow"]:
+            # EC-1: Send helpful response for unsupported content types instead of silent ignore
+            self.send_response(
+                "I can only process text messages right now. "
+                "Please type your question or type 'help' for assistance."
+            )
             return False
 
         # Check if this account is configured for chatbot
@@ -145,6 +150,13 @@ class ChatbotProcessor:
             if response:
                 self.send_response(response)
                 return
+            # If no response but session is now done, scripts already sent messages directly
+            try:
+                active_session.reload()
+                if active_session.status in ("Completed", "Cancelled"):
+                    return
+            except Exception:
+                pass
 
         # 2. Check keyword matches
         keyword_match = keyword_matcher.match(self.message_text)

@@ -111,24 +111,23 @@ class FlowEngine:
                 if not next_step:
                     return self.complete_flow(session, flow)
 
-                # Check skip conditions (loop through consecutive skippable steps)
+                # Check skip conditions (loop through consecutive skippable steps).
+                # When skipping a step, always advance by sequential idx order — NOT by
+                # the step's next_step field, which is only relevant when the step executes.
+                # Use s.idx (unique per row) to avoid infinite loops from duplicate step names.
                 session_data = parse_json(session.session_data, {})
-                max_skips = 10
+                sorted_steps_for_skip = sorted(flow.steps, key=lambda x: x.idx)
+                max_skips = 30
                 skips = 0
                 while next_step.skip_condition and skips < max_skips:
                     if not self.evaluate_skip_condition(next_step.skip_condition, session_data):
                         break
-                    next_step_name = self.get_next_step(next_step, flow.steps, None, None)
-                    if not next_step_name:
+                    # Find position by idx (unique), not step_name (may have duplicates)
+                    skip_idx = next((i for i, s in enumerate(sorted_steps_for_skip)
+                                     if s.idx == next_step.idx), None)
+                    if skip_idx is None or skip_idx >= len(sorted_steps_for_skip) - 1:
                         return self.complete_flow(session, flow)
-                    found = False
-                    for s in flow.steps:
-                        if s.step_name == next_step_name:
-                            next_step = s
-                            found = True
-                            break
-                    if not found:
-                        return self.complete_flow(session, flow)
+                    next_step = sorted_steps_for_skip[skip_idx + 1]
                     skips += 1
 
                 current_step = next_step
@@ -141,6 +140,12 @@ class FlowEngine:
             session.current_step = current_step.step_name
             session.save(ignore_permissions=True)
             frappe.db.commit()
+
+            # Run any trailing None-input steps (e.g., end_flow) so the session
+            # gets properly marked Completed even when the response step is a
+            # Template or Script that doesn't require further user input.
+            if current_step.input_type in (None, "None"):
+                self._advance_and_complete(session, flow, current_step)
 
             # Combine initial message with step message
             messages = []
@@ -235,24 +240,22 @@ class FlowEngine:
             if not next_step:
                 return self.complete_flow(session, flow)
 
-            # Check skip condition for next step (loop to skip multiple consecutive steps)
+            # Check skip condition for next step (loop to skip multiple consecutive steps).
+            # When skipping, always advance by sequential idx — not by next_step field.
+            # Use s.idx (unique per row) to avoid infinite loops from duplicate step names.
             session_data = parse_json(session.session_data, {})
-            max_skips = 10  # Safety limit
+            sorted_steps_for_skip = sorted(flow.steps, key=lambda x: x.idx)
+            max_skips = 30  # Safety limit
             skips = 0
             while next_step.skip_condition and skips < max_skips:
                 if not self.evaluate_skip_condition(next_step.skip_condition, session_data):
                     break  # Condition not met, show this step
-                next_step_name = self.get_next_step(next_step, flow.steps, None, None)
-                if not next_step_name:
+                # Find position by idx (unique), not step_name (may have duplicates)
+                skip_idx = next((i for i, s in enumerate(sorted_steps_for_skip)
+                                 if s.idx == next_step.idx), None)
+                if skip_idx is None or skip_idx >= len(sorted_steps_for_skip) - 1:
                     return self.complete_flow(session, flow)
-                found = False
-                for step in flow.steps:
-                    if step.step_name == next_step_name:
-                        next_step = step
-                        found = True
-                        break
-                if not found:
-                    return self.complete_flow(session, flow)
+                next_step = sorted_steps_for_skip[skip_idx + 1]
                 skips += 1
 
             # Update session
@@ -265,11 +268,11 @@ class FlowEngine:
             # Build and return next step message
             response = self.build_step_message(next_step, session)
 
-            # Auto-advance past Script steps with input_type=None that return no response
-            max_advances = 10  # Safety limit
+            # Auto-advance past Script/None steps that return no response, and through
+            # any skipped steps (even if they have input_type=Button).
+            max_advances = 30  # Safety limit
             advances = 0
-            while not response and next_step.input_type in ("None", None) and advances < max_advances:
-                # Script step ran but produced no response, advance to next step
+            while not response and advances < max_advances:
                 adv_next_name = self.get_next_step(next_step, flow.steps, None, None)
                 if not adv_next_name:
                     return self.complete_flow(session, flow)
@@ -282,19 +285,30 @@ class FlowEngine:
                 if not adv_next:
                     return self.complete_flow(session, flow)
 
-                # Check skip condition
+                # Check skip condition — skipped steps never execute; keep advancing
                 session_data = parse_json(session.session_data, {})
                 if adv_next.skip_condition and self.evaluate_skip_condition(adv_next.skip_condition, session_data):
                     next_step = adv_next
                     advances += 1
                     continue
 
+                # Non-skipped step: execute it
                 next_step = adv_next
                 session.current_step = next_step.step_name
                 session.save(ignore_permissions=True)
                 frappe.db.commit()
                 response = self.build_step_message(next_step, session)
                 advances += 1
+
+                # Stop here if this step needs user input (regardless of response)
+                if next_step.input_type not in (None, "None"):
+                    break
+
+            # Run any trailing None-input steps (e.g., end_flow) so the session
+            # gets marked Completed even when the current response step doesn't
+            # require further user input.
+            if response and next_step.input_type in (None, "None"):
+                self._advance_and_complete(session, flow, next_step)
 
             # Log outgoing message
             if isinstance(response, str):
@@ -470,13 +484,17 @@ class FlowEngine:
 
         # Handle WhatsApp Flow
         if step.input_type == "WhatsApp Flow" and step.whatsapp_flow:
-            return {
-                "message": message,
-                "content_type": "flow",
-                "flow": step.whatsapp_flow,
-                "flow_cta": step.flow_cta or "Open Form",
-                "flow_screen": step.flow_screen or None
-            }
+            flow_id = frappe.db.get_value("WhatsApp Flow", step.whatsapp_flow, "flow_id")
+            if flow_id:
+                return {
+                    "message": message,
+                    "content_type": "flow",
+                    "flow": step.whatsapp_flow,
+                    "flow_cta": step.flow_cta or "Open Form",
+                    "flow_screen": step.flow_screen or None
+                }
+            # Flow not yet registered with Meta — fall back to plain text prompt
+            return message or "Please type your details:"
 
         # Add options hint for Select type
         if step.input_type == "Select" and step.options:
@@ -500,6 +518,84 @@ class FlowEngine:
         except Exception:
             return False
 
+    def _advance_and_complete(self, session, flow, current_step):
+        """After a response-generating None-input step, continue running
+        subsequent None-input steps (e.g., end_flow) and mark the session
+        Completed when no more steps remain. Sends the flow's completion_message
+        as a direct outgoing WhatsApp message only if explicitly configured."""
+        try:
+            sorted_steps = sorted(flow.steps, key=lambda x: x.idx)
+            step = current_step
+
+            for _ in range(10):
+                next_name = self.get_next_step(step, flow.steps, None, None)
+                if not next_name:
+                    # No more steps — complete the flow
+                    completion_msg = self.complete_flow(session, flow)
+                    # Only send completion_message if explicitly set on the flow
+                    if completion_msg and flow.completion_message and isinstance(completion_msg, str):
+                        try:
+                            frappe.get_doc({
+                                "doctype": "WhatsApp Message",
+                                "type": "Outgoing",
+                                "to": self.phone_number,
+                                "message": completion_msg,
+                                "content_type": "text",
+                                "whatsapp_account": session.whatsapp_account
+                            }).insert(ignore_permissions=True)
+                            frappe.db.commit()
+                        except Exception as e:
+                            frappe.log_error(f"_advance_and_complete send error: {str(e)}")
+                    return
+
+                next_step = next((s for s in sorted_steps if s.step_name == next_name), None)
+                if not next_step:
+                    # Step name not found — __COMPLETE__ sentinel or missing step
+                    self.complete_flow(session, flow)
+                    return
+
+                # Check skip condition before deciding whether to run/send this step
+                session_data = parse_json(session.session_data, {})
+                if next_step.skip_condition and self.evaluate_skip_condition(next_step.skip_condition, session_data):
+                    step = next_step
+                    continue
+
+                if next_step.input_type not in (None, "None"):
+                    # This step needs user input — build its message and send it,
+                    # then wait for the user to respond.
+                    session.current_step = next_step.step_name
+                    session.save(ignore_permissions=True)
+                    frappe.db.commit()
+                    msg = self.build_step_message(next_step, session)
+                    if msg:
+                        try:
+                            msg_data = {
+                                "doctype": "WhatsApp Message",
+                                "type": "Outgoing",
+                                "to": self.phone_number,
+                                "whatsapp_account": session.whatsapp_account,
+                            }
+                            if isinstance(msg, str):
+                                msg_data["message"] = msg
+                                msg_data["content_type"] = "text"
+                            elif isinstance(msg, dict):
+                                msg_data.update(msg)
+                            doc = frappe.get_doc(msg_data)
+                            doc.flags.ignore_chatbot = True
+                            doc.insert(ignore_permissions=True)
+                            frappe.db.commit()
+                        except Exception as _send_err:
+                            frappe.log_error(f"_advance_and_complete send input step: {_send_err}")
+                    return
+
+                session.current_step = next_step.step_name
+                session.save(ignore_permissions=True)
+                frappe.db.commit()
+                self.build_step_message(next_step, session)  # Run script; ignore response
+                step = next_step
+        except Exception as e:
+            frappe.log_error(f"_advance_and_complete error: {str(e)}")
+
     def complete_flow(self, session, flow):
         """Complete a conversation flow."""
         try:
@@ -520,8 +616,13 @@ class FlowEngine:
 
             frappe.db.commit()
 
-            # Build completion message with variable substitution
-            completion_msg = flow.completion_message or "Thank you! Your request has been submitted."
+            # Only return a completion message if one is explicitly configured on the flow.
+            # Scripts that send their own messages should leave this blank so no
+            # extra "Thank you!" is sent after a direct-send step.
+            if not flow.completion_message:
+                return None
+
+            completion_msg = flow.completion_message
             for key, value in session_data.items():
                 completion_msg = completion_msg.replace(f"{{{key}}}", str(value))
 
@@ -529,7 +630,7 @@ class FlowEngine:
 
         except Exception as e:
             frappe.log_error(f"FlowEngine complete_flow error: {str(e)}")
-            return "Thank you! Your request has been received."
+            return None
 
     def create_document(self, flow, data):
         """Create a document from flow data."""
