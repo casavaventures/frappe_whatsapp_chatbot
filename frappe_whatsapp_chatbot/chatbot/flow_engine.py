@@ -308,7 +308,35 @@ class FlowEngine:
             # gets marked Completed even when the current response step doesn't
             # require further user input.
             if response and next_step.input_type in (None, "None"):
+                # Send the current response FIRST so it arrives before any
+                # messages that _advance_and_complete sends (e.g., address selector).
+                try:
+                    msg_data = {
+                        "doctype": "WhatsApp Message",
+                        "type": "Outgoing",
+                        "to": self.phone_number,
+                        "whatsapp_account": session.whatsapp_account,
+                    }
+                    if isinstance(response, str):
+                        msg_data["message"] = response
+                        msg_data["content_type"] = "text"
+                    elif isinstance(response, dict):
+                        msg_data.update(response)
+                    doc = frappe.get_doc(msg_data)
+                    doc.flags.ignore_chatbot = True
+                    doc.insert(ignore_permissions=True)
+                    frappe.db.commit()
+                except Exception as _e:
+                    frappe.log_error(f"process_input send before advance: {_e}")
+
+                if isinstance(response, str):
+                    session.add_message("Outgoing", response, next_step.step_name)
+
                 self._advance_and_complete(session, flow, next_step)
+
+                session.save(ignore_permissions=True)
+                frappe.db.commit()
+                return None  # Already sent directly; None prevents caller from re-sending
 
             # Log outgoing message
             if isinstance(response, str):
